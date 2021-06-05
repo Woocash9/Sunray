@@ -8,7 +8,12 @@
 
 #include "robot.h"
 #include "comm.h"
-#include "src/esp/WiFiEsp.h"
+#ifdef __linux__
+  #include <BridgeClient.h>
+#else
+  #include "src/esp/WiFiEsp.h"
+#endif
+#include "PubSubClient.h"
 #include "src/mpu/SparkFunMPU9250-DMP.h"
 #include "SparkFunHTU21D.h"
 #include "RunningMedian.h"
@@ -18,7 +23,9 @@
 #include "src/driver/AmRobotDriver.h"
 #include "src/driver/SerialRobotDriver.h"
 #include "battery.h"
+#include "gps.h"
 #include "src/ublox/ublox.h"
+#include "src/skytraq/skytraq.h"
 #include "buzzer.h"
 #include "rcmodel.h"
 #include "map.h"
@@ -47,17 +54,23 @@ MPU9250_DMP imu;
   SerialBatteryDriver batteryDriver(robotDriver);
   SerialBumperDriver bumper(robotDriver);
   SerialStopButtonDriver stopButton(robotDriver);
+  SerialRainSensorDriver rainDriver(robotDriver);
 #else
   AmRobotDriver robotDriver;
   AmMotorDriver motorDriver;
   AmBatteryDriver batteryDriver;
   AmBumperDriver bumper;
   AmStopButtonDriver stopButton;
+  AmRainSensorDriver rainDriver;
 #endif
 Motor motor;
 Battery battery;
 PinManager pinMan;
-UBLOX gps(GPS,GPS_BAUDRATE);
+#ifdef GPS_SKYTRAQ
+  SKYTRAQ gps;
+#else 
+  UBLOX gps;
+#endif 
 BLEConfig bleConfig;
 Buzzer buzzer;
 Sonar sonar;
@@ -68,9 +81,14 @@ RCModel rcmodel;
 PID pidLine(0.2, 0.01, 0); // not used
 PID pidAngle(2, 0.1, 0);  // not used
 
+int stateButton = 0;  
+int stateButtonTemp = 0;
+unsigned long stateButtonTimeout = 0;
 OperationType stateOp = OP_IDLE; // operation-mode
 Sensor stateSensor = SENS_NONE; // last triggered sensor
 unsigned long controlLoops = 0;
+String stateOpText = "";  // current operation as text
+String gpsSolText = ""; // current gps solution as text
 float stateX = 0;  // position-east (m)
 float stateY = 0;  // position-north (m)
 float stateDelta = 0;  // direction (rad)
@@ -105,7 +123,7 @@ float lastGPSMotionX = 0;
 float lastGPSMotionY = 0;
 unsigned long nextGPSMotionCheckTime = 0;
 
-UBLOX::SolType lastSolution = UBLOX::SOL_INVALID;    
+SolType lastSolution = SOL_INVALID;    
 unsigned long nextStatTime = 0;
 unsigned long nextToFTime = 0;
 unsigned long statIdleDuration = 0; // seconds
@@ -149,13 +167,20 @@ bool wifiFound = false;
 char ssid[] = WIFI_SSID;      // your network SSID (name)
 char pass[] = WIFI_PASS;        // your network password
 WiFiEspServer server(80);
-WiFiEspClient client = NULL;
-int status = WL_IDLE_STATUS;     // the Wifi radio's status
+bool hasClient = false;
+WiFiEspClient client;
+WiFiEspClient espClient;
+PubSubClient mqttClient(espClient);
+//int status = WL_IDLE_STATUS;     // the Wifi radio's status
+#ifdef __linux__
+  NTRIPClient ntrip;
+#endif
 
 float dockSignal = 0;
 float dockAngularSpeed = 0.1;
 bool dockingInitiatedByOperator = true;
 bool gpsJump = false;
+int motorErrorCounter = 0;
 
 RunningMedian<unsigned int,3> tofMeasurements;
 
@@ -163,13 +188,6 @@ RunningMedian<unsigned int,3> tofMeasurements;
 // must be defined to override default behavior
 void watchdogSetup (void){} 
 
-
-// get free memory
-// https://learn.adafruit.com/memories-of-an-arduino/measuring-free-memory
-int freeMemory() {
-  char top;
-  return &top - reinterpret_cast<char*>(sbrk(0));
-}
 
 // reset motion measurement
 void resetLinearMotionMeasurement(){
@@ -214,6 +232,46 @@ void dumpState(){
   CONSOLE.print(absolutePosSourceLon);
   CONSOLE.print(" lat=");
   CONSOLE.println(absolutePosSourceLat);
+}
+
+void updateStateOpText(){
+  switch (stateOp){
+    case OP_IDLE: stateOpText = "idle"; break;
+    case OP_MOW: stateOpText = "mow"; break;
+    case OP_CHARGE: stateOpText = "charge"; break;
+    case OP_ERROR: 
+      stateOpText = "error (";
+      switch (stateSensor){
+        case SENS_NONE: stateOpText += "none)"; break;
+        case SENS_BAT_UNDERVOLTAGE: stateOpText += "unvervoltage)"; break;            
+        case SENS_OBSTACLE: stateOpText += "obstacle)"; break;      
+        case SENS_GPS_FIX_TIMEOUT: stateOpText += "fix timeout)"; break;
+        case SENS_IMU_TIMEOUT: stateOpText += "imu timeout)"; break;
+        case SENS_IMU_TILT: stateOpText += "imu tilt)"; break;
+        case SENS_KIDNAPPED: stateOpText += "kidnapped)"; break;
+        case SENS_OVERLOAD: stateOpText += "overload)"; break;
+        case SENS_MOTOR_ERROR: stateOpText += "motor error)"; break;
+        case SENS_GPS_INVALID: stateOpText += "gps invalid)"; break;
+        case SENS_ODOMETRY_ERROR: stateOpText += "odo error)"; break;
+        case SENS_MAP_NO_ROUTE: stateOpText += "no map route)"; break;
+        case SENS_MEM_OVERFLOW: stateOpText += "mem overflow)"; break;
+        case SENS_BUMPER: stateOpText += "bumper)"; break;
+        case SENS_SONAR: stateOpText += "sonar)"; break;
+        case SENS_LIFT: stateOpText += "lift)"; break;
+        case SENS_RAIN: stateOpText += "rain)"; break;
+        case SENS_STOP_BUTTON: stateOpText += "stop button)"; break;
+        default: stateOpText += "unknown)"; break;
+      }
+      break;
+    case OP_DOCK: stateOpText = "dock"; break;
+    default: stateOpText = "unknown"; break;
+  }
+  switch (gps.solution){
+    case SOL_INVALID: gpsSolText = "invalid"; break;
+    case SOL_FLOAT: gpsSolText = "float"; break;
+    case SOL_FIXED: gpsSolText ="fixed"; break;
+    default: gpsSolText = "unknown";      
+  }
 }
 
 double calcStateCRC(){
@@ -294,7 +352,7 @@ bool saveState(){
   stateCRC = crc;
   dumpState();
   CONSOLE.print("save state... ");
-  stateFile = SD.open("state.bin",  O_WRITE | O_CREAT);
+  stateFile = SD.open("state.bin",  FILE_CREATE); // O_WRITE | O_CREAT);
   if (!stateFile){        
     CONSOLE.println("ERROR opening file for writing");
     return false;
@@ -376,6 +434,10 @@ void sensorTest(){
 
 
 void startWIFI(){
+#ifdef __linux__
+  wifiFound = true;
+#else  
+  int status = WL_IDLE_STATUS;     // the Wifi radio's status
   WIFI.begin(WIFI_BAUDRATE); 
   WIFI.print("AT\r\n");  
   delay(500);
@@ -391,42 +453,50 @@ void startWIFI(){
   WiFi.init(&WIFI);  
   if (WiFi.status() == WL_NO_SHIELD) {
     CONSOLE.println("ERROR: WiFi not present");       
+    return;
+  }   
+  wifiFound = true;
+  CONSOLE.print("WiFi found! ESP8266 firmware: ");
+  CONSOLE.println(WiFi.firmwareVersion());       
+  if (START_AP){
+    CONSOLE.print("Attempting to start AP ");  
+    CONSOLE.println(ssid);
+    // uncomment these two lines if you want to set the IP address of the AP
+    #ifdef WIFI_IP  
+      IPAddress localIp(WIFI_IP);
+      WiFi.configAP(localIp);  
+    #endif            
+    // start access point
+    status = WiFi.beginAP(ssid, 10, pass, ENC_TYPE_WPA2_PSK);         
   } else {
-    wifiFound = true;
-    CONSOLE.println("WiFi found!");       
-    if (START_AP){
-      CONSOLE.print("Attempting to start AP ");  
-      CONSOLE.println(ssid);
-      // uncomment these two lines if you want to set the IP address of the AP
+    while ( status != WL_CONNECTED) {
+      CONSOLE.print("Attempting to connect to WPA SSID: ");
+      CONSOLE.println(ssid);      
+      status = WiFi.begin(ssid, pass);
       #ifdef WIFI_IP  
         IPAddress localIp(WIFI_IP);
-        WiFi.configAP(localIp);  
-      #endif            
-      // start access point
-      status = WiFi.beginAP(ssid, 10, pass, ENC_TYPE_WPA2_PSK);         
-    } else {
-      while ( status != WL_CONNECTED) {
-        CONSOLE.print("Attempting to connect to WPA SSID: ");
-        CONSOLE.println(ssid);      
-        status = WiFi.begin(ssid, pass);
-        #ifdef WIFI_IP  
-          IPAddress localIp(WIFI_IP);
-          WiFi.config(localIp);  
-        #endif
-      }    
-    }        
-    #if defined(ENABLE_UDP)
-      udpSerial.beginUDP();  
-    #endif    
-    CONSOLE.print("You're connected with SSID=");    
-    CONSOLE.print(WiFi.SSID());
-    CONSOLE.print(" and IP=");        
-    IPAddress ip = WiFi.localIP();    
-    CONSOLE.println(ip);   
-    if (ENABLE_SERVER){
-      server.begin();
-    }
-  }    
+        WiFi.config(localIp);  
+      #endif
+    }    
+  } 
+  CONSOLE.print("You're connected with SSID=");    
+  CONSOLE.print(WiFi.SSID());
+  CONSOLE.print(" and IP=");        
+  IPAddress ip = WiFi.localIP();    
+  CONSOLE.println(ip);   
+#endif         
+  #if defined(ENABLE_UDP)
+    udpSerial.beginUDP();  
+  #endif    
+  if (ENABLE_SERVER){
+    //server.listenOnLocalhost();
+    server.begin();
+  }
+  if (ENABLE_MQTT){
+    CONSOLE.println("MQTT: enabled");
+    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+  }  
 }
 
 
@@ -625,9 +695,10 @@ void start(){
   pinMan.begin();       
   // keep battery switched ON
   pinMode(pinBatterySwitch, OUTPUT);    
-  pinMode(pinDockingReflector, INPUT);
+  //pinMode(pinDockingReflector, INPUT);
   digitalWrite(pinBatterySwitch, HIGH);         
   pinMode(pinButton, INPUT_PULLUP);
+  pinMode(pinRain, INPUT);
   buzzer.begin();      
   CONSOLE.begin(CONSOLE_BAUDRATE);  
     
@@ -665,12 +736,13 @@ void start(){
   
   batteryDriver.begin();
   robotDriver.begin();
-  motorDriver.begin();  
+  motorDriver.begin();
+  rainDriver.begin();  
   battery.begin();      
   stopButton.begin();
 
   bleConfig.run();   
-  BLE.println(VER);  
+  //BLE.println(VER); is this needed? can confuse BLE modules if not connected?  
     
   rcmodel.begin();  
   motor.begin();
@@ -690,22 +762,25 @@ void start(){
   CONSOLE.print("SERIAL_BUFFER_SIZE=");
   CONSOLE.print(SERIAL_BUFFER_SIZE);
   CONSOLE.println(" (increase if you experience GPS checksum errors)");
-  CONSOLE.println("-----------------------------------------------------");
-  CONSOLE.println("NOTE: if you experience GPS checksum errors, try to increase UART FIFO size:");
-  CONSOLE.println("1. Arduino IDE->File->Preferences->Click on 'preferences.txt' at the bottom");
-  CONSOLE.println("2. Locate file 'packages/arduino/hardware/sam/xxxxx/cores/arduino/RingBuffer.h");
-  CONSOLE.println("   for Grand Central M4 'packages/adafruit/hardware/samd/xxxxx/cores/arduino/RingBuffer.h");  
-  CONSOLE.println("change:     #define SERIAL_BUFFER_SIZE 128     into into:     #define SERIAL_BUFFER_SIZE 1024");
+  //CONSOLE.println("-----------------------------------------------------");
+  //CONSOLE.println("NOTE: if you experience GPS checksum errors, try to increase UART FIFO size:");
+  //CONSOLE.println("1. Arduino IDE->File->Preferences->Click on 'preferences.txt' at the bottom");
+  //CONSOLE.println("2. Locate file 'packages/arduino/hardware/sam/xxxxx/cores/arduino/RingBuffer.h");
+  //CONSOLE.println("   for Grand Central M4 'packages/adafruit/hardware/samd/xxxxx/cores/arduino/RingBuffer.h");  
+  //CONSOLE.println("change:     #define SERIAL_BUFFER_SIZE 128     into into:     #define SERIAL_BUFFER_SIZE 1024");
   CONSOLE.println("-----------------------------------------------------");
   
-  gps.begin();   
+  gps.begin(GPS,GPS_BAUDRATE);   
   maps.begin();      
   //maps.clipperTest();
   
   myHumidity.begin();    
   
   // initialize ESP module
-  startWIFI();  
+  startWIFI();
+  #ifdef __linux__
+    ntrip.begin();  
+  #endif
   
   watchdogEnable(10000L);   // 10 seconds  
   
@@ -727,12 +802,12 @@ void calcStats(){
         break;
       case OP_MOW:      
         statMowDuration++;
-        if (gps.solution == UBLOX::SOL_FIXED) statMowDurationFix++;
-          else if (gps.solution == UBLOX::SOL_FLOAT) statMowDurationFloat++;   
-          else if (gps.solution == UBLOX::SOL_INVALID) statMowDurationInvalid++;
+        if (gps.solution == SOL_FIXED) statMowDurationFix++;
+          else if (gps.solution == SOL_FLOAT) statMowDurationFloat++;   
+          else if (gps.solution == SOL_INVALID) statMowDurationInvalid++;
         if (gps.solution != lastSolution){      
-          if ((lastSolution == UBLOX::SOL_FLOAT) && (gps.solution == UBLOX::SOL_FIXED)) statMowFloatToFixRecoveries++;
-          if (lastSolution == UBLOX::SOL_INVALID) statMowInvalidRecoveries++;
+          if ((lastSolution == SOL_FLOAT) && (gps.solution == SOL_FIXED)) statMowFloatToFixRecoveries++;
+          if (lastSolution == SOL_INVALID) statMowInvalidRecoveries++;
           lastSolution = gps.solution;
         } 
         statMowMaxDgpsAge = max(statMowMaxDgpsAge, (millis() - gps.dgpsAge)/1000.0);        
@@ -775,7 +850,7 @@ void computeRobotState(){
   }
   
   if ((gps.solutionAvail) 
-      && ((gps.solution == UBLOX::SOL_FIXED) || (gps.solution == UBLOX::SOL_FLOAT))  )
+      && ((gps.solution == SOL_FIXED) || (gps.solution == SOL_FLOAT))  )
   {
     gps.solutionAvail = false;        
     stateGroundSpeed = 0.9 * stateGroundSpeed + 0.1 * gps.groundSpeed;    
@@ -797,8 +872,8 @@ void computeRobotState(){
         if (motor.linearSpeedSet < 0) stateDeltaGPS = scalePI(stateDeltaGPS + PI); // consider if driving reverse
         //stateDeltaGPS = scalePI(2*PI-gps.heading+PI/2);
         float diffDelta = distancePI(stateDelta, stateDeltaGPS);                 
-        if (    (gps.solution == UBLOX::SOL_FIXED)
-             || ((gps.solution == UBLOX::SOL_FLOAT) && (maps.useGPSfloatForDeltaEstimation)) )
+        if (    (gps.solution == SOL_FIXED)
+             || ((gps.solution == SOL_FLOAT) && (maps.useGPSfloatForDeltaEstimation)) )
         {   // allows planner to use float solution?         
           if (fabs(diffDelta/PI*180) > 45){ // IMU-based heading too far away => use GPS heading
             stateDelta = stateDeltaGPS;
@@ -813,7 +888,7 @@ void computeRobotState(){
       lastPosN = posN;
       lastPosE = posE;
     } 
-    if (gps.solution == UBLOX::SOL_FIXED) {
+    if (gps.solution == SOL_FIXED) {
       // fix
       lastFixTime = millis();
       stateX = posE;
@@ -885,12 +960,20 @@ void detectSensorMalfunction(){
   }
   if (ENABLE_FAULT_DETECTION){
     if (motor.motorError){
-      motor.motorError = false;
+      // this is the molehole situation: motor error will permanently trigger on molehole => we try obstacle avoidance (molehole avoidance strategy)
+      motor.motorError = false; // reset motor error flag
+      motorErrorCounter++; 
+      if (motorErrorCounter < 5){ 
+        //stateSensor = SENS_MOTOR_ERROR;
+        triggerObstacle();     // trigger obstacle avoidance 
+        return;
+      }
+      // obstacle avoidance failed with too many motor errors (it was probably not a molehole situation)
       CONSOLE.println("motor error!");
       stateSensor = SENS_MOTOR_ERROR;
       setOperation(OP_ERROR);
       buzzer.sound(SND_ERROR, true);       
-      return;       
+      return;      
     }  
   }
 }
@@ -919,7 +1002,7 @@ void detectObstacle(){
   }   
   
   if (BUMPER_ENABLE){
-    if ( (millis() > linearMotionStartTime + 5000) && (bumper.obstacle()) ){  
+    if ( (millis() > linearMotionStartTime + BUMPER_DEADTIME) && (bumper.obstacle()) ){  
       CONSOLE.println("bumper obstacle!");    
       statMowBumperCounter++;
       triggerObstacle();    
@@ -1029,7 +1112,7 @@ void trackLine(){
       linear = 0.1; // reduce speed when approaching/leaving waypoints          
     } 
     else {
-      if (gps.solution == UBLOX::SOL_FLOAT)        
+      if (gps.solution == SOL_FLOAT)        
         linear = min(setSpeed, 0.1); // reduce speed for float solution
       else
         linear = setSpeed;         // desired speed
@@ -1061,11 +1144,11 @@ void trackLine(){
       stateSensor = SENS_GPS_FIX_TIMEOUT;
       //angular = 0.2;
     } else {
-      if (stateSensor == SENS_GPS_FIX_TIMEOUT) stateSensor = SENS_NONE; // clear fix timeout
+      //if (stateSensor == SENS_GPS_FIX_TIMEOUT) stateSensor = SENS_NONE; // clear fix timeout
     }       
   }     
   
-  if ((gps.solution == UBLOX::SOL_FIXED) || (gps.solution == UBLOX::SOL_FLOAT)){        
+  if ((gps.solution == SOL_FIXED) || (gps.solution == SOL_FLOAT)){        
     if (linear > 0.06) {
       if ((millis() > linearMotionStartTime + 5000) && (stateGroundSpeed < 0.03)){
         // if in linear motion and not enough ground speed => obstacle
@@ -1109,6 +1192,8 @@ void trackLine(){
   if (targetReached){
     if (maps.wayMode == WAY_MOW){
       maps.clearObstacles(); // clear obstacles if target reached
+      motorErrorCounter = 0; // reset motor error counter if target reached
+      stateSensor = SENS_NONE; // clear last triggered sensor
     }
     bool straight = maps.nextPointIsStraight();
     if (!maps.nextPoint(false)){
@@ -1137,12 +1222,16 @@ void trackLine(){
 
 // robot main loop
 void run(){  
+  #ifdef __linux__
+    ntrip.run();
+  #endif
   robotDriver.run();
   buzzer.run();
   stopButton.run();
   battery.run();
   batteryDriver.run();
   motorDriver.run();
+  rainDriver.run();
   motor.run();
   sonar.run();
   maps.run();  
@@ -1167,7 +1256,8 @@ void run(){
     CONSOLE.print("  humidity=");
     CONSOLE.print(stateHumidity,0);    
     CONSOLE.print(" ");    
-    logCPUHealth();    
+    logCPUHealth();
+    CONSOLE.println();    
   }
   
   // IMU
@@ -1267,11 +1357,14 @@ void run(){
             setOperation(OP_DOCK);
           }
         }
-        if (stopButton.triggered()){
-          CONSOLE.println("stopButton triggered!");
-          stateSensor = SENS_STOP_BUTTON;
-          setOperation(OP_IDLE);
-        }
+        if (RAIN_ENABLE){
+          if (rainDriver.triggered()){
+            if (DOCKING_STATION){
+              stateSensor = SENS_RAIN;
+              setOperation(OP_DOCK);
+            }
+          }
+        }        
       }
       else if (stateOp == OP_CHARGE){      
         if (battery.chargerConnected()){
@@ -1286,18 +1379,55 @@ void run(){
           }
         } else {
           setOperation(OP_IDLE);        
-        }
+        }        
+      }      
+      
+      // process button state
+      if (stateButton == 1){        
+        stateButton = 0;  // reset button state
+        if ((stateOp == OP_MOW) || (stateOp == OP_DOCK)) {
+          stateSensor = SENS_STOP_BUTTON;
+          setOperation(OP_IDLE, false, true);                     
+        } else {
+          stateSensor = SENS_STOP_BUTTON;
+          setOperation(OP_MOW, false, true);
+        }      
+      } else if (stateButton == 5){
+        stateButton = 0; // reset button state
+        stateSensor = SENS_STOP_BUTTON;
+        setOperation(OP_DOCK, false, true);
       }
       
       
-    }    
-  }
+    } // if (!imuIsCalibrating)        
+  }   // if (millis() >= nextControlTime)
     
   // ----- read serial input (BT/console) -------------
   processComm();
   outputConsole();       
-  watchdogReset();     
-}
+  watchdogReset();
+
+  // compute button state (stateButton)
+  if (BUTTON_CONTROL){
+    if (stopButton.triggered()){
+      if (millis() > stateButtonTimeout){
+        stateButtonTimeout = millis() + 1000;
+        stateButtonTemp++; // next state
+        buzzer.sound(SND_READY, true);                                     
+      }
+                          
+    } else {
+      if (stateButtonTemp > 0){
+        // button released => set stateButton
+        stateButtonTimeout = 0;
+        stateButton = stateButtonTemp;
+        stateButtonTemp = 0;
+        CONSOLE.print("stateButton ");
+        CONSOLE.println(stateButton);
+      }
+    }
+  }    
+}        
 
 
 
@@ -1327,7 +1457,7 @@ void setOperation(OperationType op, bool allowRepeat, bool initiatedbyOperator){
           resetGPSMotionMeasurement;
           lastFixTime = millis();                
           maps.setLastTargetPoint(stateX, stateY);        
-          stateSensor = SENS_NONE;                  
+          //stateSensor = SENS_NONE;                  
         } else {
           error = true;
           CONSOLE.println("error: no waypoints!");
@@ -1349,7 +1479,7 @@ void setOperation(OperationType op, bool allowRepeat, bool initiatedbyOperator){
           resetGPSMotionMeasurement();
           lastFixTime = millis();                
           maps.setLastTargetPoint(stateX, stateY);        
-          stateSensor = SENS_NONE;
+          //stateSensor = SENS_NONE;
           motor.setMowState(true);                
         } else {
           error = true;
@@ -1377,7 +1507,3 @@ void setOperation(OperationType op, bool allowRepeat, bool initiatedbyOperator){
   stateOp = op;  
   saveState();
 }
-
-
-
-

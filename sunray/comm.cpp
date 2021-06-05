@@ -2,7 +2,12 @@
 #include "config.h"
 #include "robot.h"
 #include "reset.h"
-#include "src/esp/WiFiEsp.h"
+#ifdef __linux__
+  #include <BridgeClient.h>
+#else
+  #include "src/esp/WiFiEsp.h"
+#endif
+#include "RingBuffer.h"
 
 unsigned long nextInfoTime = 0;
 bool triggerWatchdog = false;
@@ -24,6 +29,15 @@ int reqCount = 0;                // number of requests received
 unsigned long stopClientTime = 0;
 float statControlCycleTime = 0; 
 float statMaxControlCycleTime = 0; 
+
+// mqtt
+#define MSG_BUFFER_SIZE	(50)
+char mqttMsg[MSG_BUFFER_SIZE];
+unsigned long nextPublishTime = 0;
+
+// wifi client
+WiFiEspClient wifiClient;
+unsigned long nextWifiClientCheckTime = 0;
 
 
 // answer Bluetooth with CRC
@@ -122,6 +136,12 @@ void cmdMotorTest(){
   String s = F("E");
   cmdAnswer(s);
   motor.test();  
+}
+
+void cmdMotorPlot(){
+  String s = F("Q");
+  cmdAnswer(s);
+  motor.plot();  
 }
 
 void cmdSensorTest(){
@@ -359,24 +379,24 @@ void cmdToggleGPSSolution(){
   cmdAnswer(s);  
   CONSOLE.println("toggle GPS solution");
   switch (gps.solution){
-    case UBLOX::SOL_INVALID:  
+    case SOL_INVALID:  
       gps.solutionAvail = true;
-      gps.solution = UBLOX::SOL_FLOAT;
+      gps.solution = SOL_FLOAT;
       gps.relPosN = stateY - 2.0;  // simulate pos. solution jump
       gps.relPosE = stateX - 2.0;
       lastFixTime = millis();
       stateGroundSpeed = 0.1;
       break;
-    case UBLOX::SOL_FLOAT:  
+    case SOL_FLOAT:  
       gps.solutionAvail = true;
-      gps.solution = UBLOX::SOL_FIXED;
+      gps.solution = SOL_FIXED;
       stateGroundSpeed = 0.1;
       gps.relPosN = stateY + 2.0;  // simulate undo pos. solution jump
       gps.relPosE = stateX + 2.0;
       break;
-    case UBLOX::SOL_FIXED:  
+    case SOL_FIXED:  
       gps.solutionAvail = true;
-      gps.solution = UBLOX::SOL_INVALID;
+      gps.solution = SOL_INVALID;
       break;
   }
 }
@@ -573,6 +593,7 @@ void processCmd(bool checkCrc, bool decrypt){
   if (cmd[3] == 'T') cmdStats();
   if (cmd[3] == 'L') cmdClearStats();
   if (cmd[3] == 'E') cmdMotorTest();  
+  if (cmd[3] == 'Q') cmdMotorPlot();  
   if (cmd[3] == 'O') cmdObstacle();  
   if (cmd[3] == 'F') cmdSensorTest(); 
   if (cmd[3] == 'G') cmdToggleGPSSolution();   // for developers
@@ -628,26 +649,99 @@ void processBLE(){
   }  
 }  
 
-// process WIFI input
-void processWifi()
+// process WIFI input (relay client)
+// a relay server allows to access the robot via the Internet by transferring data from app to robot and vice versa
+// client (app) --->  relay server  <--- client (robot)
+void processWifiRelayClient(){
+  if (!wifiFound) return;
+  if (!ENABLE_RELAY) return;
+  if (!wifiClient.connected() || (wifiClient.available() == 0)){
+    if (millis() > nextWifiClientCheckTime){   
+      wifiClient.stop();
+      CONSOLE.println("WIF: connecting..." RELAY_HOST);    
+      if (!wifiClient.connect(RELAY_HOST, RELAY_PORT)) {
+        CONSOLE.println("WIF: connection failed");
+        nextWifiClientCheckTime = millis() + 10000;
+        return;
+      }
+      CONSOLE.println("WIF: connected!");   
+      String s = "GET / HTTP/1.1\r\n";
+      s += "Host: " RELAY_USER "." RELAY_MACHINE "." RELAY_HOST ":";        
+      s += String(RELAY_PORT) + "\r\n";
+      s += "Content-Length: 0\r\n";
+      s += "\r\n\r\n";
+      wifiClient.print(s);
+    } else return;
+  }
+  nextWifiClientCheckTime = millis() + 10000;     
+  
+  buf.init();                               // initialize the circular buffer   
+  unsigned long timeout = millis() + 500;
+    
+  while (millis() < timeout) {              // loop while the client's connected    
+    if (wifiClient.available()) {               // if there's bytes to read from the client,        
+      char c = wifiClient.read();               // read a byte, then
+      timeout = millis() + 200;
+      buf.push(c);                          // push it to the ring buffer
+      // you got two newline characters in a row
+      // that's the end of the HTTP request, so send a response
+      if (buf.endsWith("\r\n\r\n")) {
+        cmd = "";
+        while ((wifiClient.connected()) && (wifiClient.available()) && (millis() < timeout)) {
+          char ch = wifiClient.read();
+          timeout = millis() + 200;
+          cmd = cmd + ch;
+          gps.run();
+        }
+        CONSOLE.print("WIF:");
+        CONSOLE.println(cmd);
+        if (wifiClient.connected()) {
+          processCmd(true,true);
+          String s = "HTTP/1.1 200 OK\r\n";
+            s += "Host: " RELAY_USER "." RELAY_MACHINE "." RELAY_HOST ":";        
+            s += String(RELAY_PORT) + "\r\n";
+            s += "Access-Control-Allow-Origin: *\r\n";              
+            s += "Content-Type: text/html\r\n";              
+            s += "Connection: close\r\n";  // the connection will be closed after completion of the response
+            // "Refresh: 1\r\n"        // refresh the page automatically every 20 sec                                    
+            s += "Content-length: ";
+            s += String(cmdResponse.length());
+            s += "\r\n\r\n";  
+            s += cmdResponse;                      
+            wifiClient.print(s);                                   
+        }
+        break;
+      }
+    }
+  }
+}
+
+
+
+// process WIFI input (App server)
+// client (app) --->  server (robot)
+void processWifiAppServer()
 {
   if (!wifiFound) return;
   if (!ENABLE_SERVER) return;
   // listen for incoming clients    
-  if (client != NULL){
+  if (client){
     if (stopClientTime != 0) {
       if (millis() > stopClientTime){
+        CONSOLE.println("app stopping client");
         client.stop();
-        stopClientTime = 0;
-        client = NULL;           
+        stopClientTime = 0;                   
       }
       return;    
     }     
   }
-  client = server.available();      
-  if (client != NULL) {                               // if you get a client,
+  if (!client){
+    //CONSOLE.println("client is NULL");
+    client = server.available();      
+  }
+  if (client) {                               // if you get a client,
+    CONSOLE.println("New client");             // print a message out the serial port
     battery.resetIdle();
-    //CONSOLE.println("New client");             // print a message out the serial port
     buf.init();                               // initialize the circular buffer
     unsigned long timeout = millis() + 50;
     while ( (client.connected()) && (millis() < timeout) ) {              // loop while the client's connected
@@ -687,7 +781,7 @@ void processWifi()
       gps.run();
     }    
     // give the web browser time to receive the data
-    stopClientTime = millis() + 20;
+    stopClientTime = millis() + 100;
     //delay(10);
     // close the connection
     //client.stop();
@@ -695,10 +789,77 @@ void processWifi()
   }                  
 }
 
+
+void mqttReconnect() {
+  // Loop until we're reconnected
+  if (!mqttClient.connected()) {
+    CONSOLE.println("MQTT: Attempting connection...");
+    // Create a random client ID
+    String clientId = "ESP8266Client-";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (mqttClient.connect(clientId.c_str())) {
+      CONSOLE.println("MQTT: connected");
+      // Once connected, publish an announcement...
+      //mqttClient.publish("outTopic", "hello world");
+      // ... and resubscribe
+      CONSOLE.println("MQTT: subscribing " MQTT_TOPIC_PREFIX "/cmd");
+      mqttClient.subscribe(MQTT_TOPIC_PREFIX "/cmd");
+    } else {
+      CONSOLE.print("MQTT: failed, rc=");
+      CONSOLE.print(mqttClient.state());
+    }
+  }
+}
+
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  CONSOLE.print("MQTT: Message arrived [");
+  CONSOLE.print(topic);
+  CONSOLE.print("] ");
+  String cmd = ""; 
+  for (int i = 0; i < length; i++) {
+    cmd += (char)payload[i];    
+  }
+  CONSOLE.println(cmd);
+  if (cmd == "dock") {
+    setOperation(OP_DOCK, false, true);
+  } else if (cmd ==  "stop") {
+    setOperation(OP_IDLE, false, true);
+  } else if (cmd == "start"){
+    setOperation(OP_MOW, false, true);
+  }
+}
+
+// process MQTT input/output (subcriber/publisher)
+void processWifiMqttClient()
+{
+  if (!ENABLE_MQTT) return; 
+  if (millis() >= nextPublishTime){
+    nextPublishTime = millis() + 10000;
+    if (mqttClient.connected()) {
+      updateStateOpText();
+      snprintf (mqttMsg, MSG_BUFFER_SIZE, "%s", stateOpText.c_str());                
+      //CONSOLE.println("MQTT: publishing " MQTT_TOPIC_PREFIX "/status");      
+      mqttClient.publish(MQTT_TOPIC_PREFIX "/op", mqttMsg);      
+      snprintf (mqttMsg, MSG_BUFFER_SIZE, "%.2f, %.2f", gps.relPosN, gps.relPosE);          
+      mqttClient.publish(MQTT_TOPIC_PREFIX "/gps/pos", mqttMsg);
+      snprintf (mqttMsg, MSG_BUFFER_SIZE, "%s", gpsSolText.c_str());          
+      mqttClient.publish(MQTT_TOPIC_PREFIX "/gps/sol", mqttMsg);    
+    } else {
+      mqttReconnect();  
+    }
+  }
+  mqttClient.loop();
+}
+
+
 void processComm(){
   processConsole();     
   processBLE();     
-  processWifi();
+  processWifiAppServer();
+  processWifiRelayClient();
+  processWifiMqttClient();
   if (triggerWatchdog) {
     CONSOLE.println("hang test - watchdog should trigger and perform a reset");
     while (true){
@@ -738,9 +899,11 @@ void outputConsole(){
     CONSOLE.print (stateOp);
     CONSOLE.print (" freem=");
     CONSOLE.print (freeMemory ());
-    uint32_t *spReg = (uint32_t*)__get_MSP();   // stack pointer
-    CONSOLE.print (" sp=");
-    CONSOLE.print (*spReg, HEX);
+    #ifndef __linux__
+      uint32_t *spReg = (uint32_t*)__get_MSP();   // stack pointer
+      CONSOLE.print (" sp=");
+      CONSOLE.print (*spReg, HEX);
+    #endif
     CONSOLE.print(" volt=");
     CONSOLE.print(battery.batteryVoltage);
     CONSOLE.print(" chg=");
